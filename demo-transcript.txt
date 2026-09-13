@@ -1,0 +1,20 @@
+SCRIPTED MODEL DEMONSTRATION — real graph and fixtures; no API calls or email delivery.
+
+Customer: I'm the policyholder, Margaret Chen. My DOB is March 15, 1985.
+Agent [VERIFY_ID]: To protect claim information, I need three permitted identity details. Could you provide your phone number including country code? You can use email address or SSN last four instead.
+
+Customer: My SSN last four is 4472.
+Agent [RESOLVE_INTENT]: Your identity is verified. What would you like help with regarding your claim?
+
+Customer: Why was my January 2026 healthcare claim denied?
+Agent [PROCESS_CASE]: The record says the review file lacked the pathology report and treating provider office note. The recorded appeal deadline was March 18, 2026, which has passed. These fixtures do not say whether a late appeal can be accepted; human clarification is needed.
+
+Customer: That's everything, thanks.
+Agent [POST_PROCESS]: Would you like an email summary of what we discussed and the next steps, or should we skip it? Email delivery is simulated in this demo.
+
+Customer: Yes, please send the email summary.
+Agent [POST_PROCESS]: You chose the email summary. Here is its preview. No email was actually sent because delivery is simulated.
+
+We discussed the denial of CL-2048. The record lists a missing pathology report and treating provider office note. Its March 18, 2026 appeal deadline has passed. Ask a human claims representative whether any late-appeal options exist; acceptance is not established by these fixtures.
+
+All four phases demonstrated. Summary delivery: preview_generated.
