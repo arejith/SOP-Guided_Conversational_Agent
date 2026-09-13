@@ -118,9 +118,7 @@ class RepresentativeAuthorizationService:
         )
 
         if representative is None:
-            raise ValueError(
-                "No matching representative record was found."
-            )
+            raise ValueError("No matching representative record was found.")
 
         request_id = str(uuid4())
 
@@ -159,9 +157,7 @@ class RepresentativeAuthorizationService:
             raise ValueError("Unknown authorization request.")
 
         if request.party_id != verified_party_id:
-            raise ValueError(
-                "Authorization request belongs to another policyholder."
-            )
+            raise ValueError("Authorization request belongs to another policyholder.")
 
         if request.status != "pending":
             return request.status
@@ -169,10 +165,7 @@ class RepresentativeAuthorizationService:
         request.status = self.status_sequence[request.polls]
         request.polls += 1
 
-        if (
-            request.status == "pending"
-            and request.polls >= len(self.status_sequence)
-        ):
+        if request.status == "pending" and request.polls >= len(self.status_sequence):
             request.status = "timeout"
 
         return request.status
@@ -210,8 +203,6 @@ class RepresentativeAuthorizationService:
         return (
             request.status == "approved"
             and request.party_id == verified_party_id
-            and normalize(request.representative_name)
-            == normalize(representative_name)
-            and normalize(request.relationship)
-            == normalize(relationship)
+            and normalize(request.representative_name) == normalize(representative_name)
+            and normalize(request.relationship) == normalize(relationship)
         )
