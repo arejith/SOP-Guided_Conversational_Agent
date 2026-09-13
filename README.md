@@ -117,12 +117,11 @@ python -m tests.demo_workflow
 
 It runs the actual graph and fixtures with explicitly scripted model decisions.
 It demonstrates all phases and preview delivery, but is not evidence of live
-language understanding. See [the recorded transcript](docs/demo-transcript.txt).
+language understanding. See [the recorded transcript](demo-transcript.txt).
 
 ## Tests and review
 
 ```bash
-python -m pip install -r requirements-dev.txt
 python -m pytest -q
 python -m ruff check agent services app.py tests
 python -m ruff format --check agent services app.py tests
