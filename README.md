@@ -5,6 +5,12 @@ Python controls identity checks, representative authorization, claim ownership,
 and transitions through `VERIFY_ID → RESOLVE_INTENT → PROCESS_CASE → POST_PROCESS`.
 The model interprets customer language and writes answers using authorized records.
 
+## Live Demo
+
+Try the [SOP-Guided Conversational Agent](https://sop-guided-conversational-agent.onrender.com/).
+
+**Heads up:** The demo uses Render’s free tier, so it may take about a minute or two to load after inactivity.
+
 ## Run locally
 download python 3.11
 
@@ -170,3 +176,4 @@ be checked before presenting the live demo.
   depend on model interpretation. Use only fictional customer information.
 - Runtime API requests use `store=False`; this does not imply that provider-side
   retention is universally disabled. Review provider data controls for any real deployment.
+
