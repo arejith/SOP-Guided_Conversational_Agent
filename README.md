@@ -5,6 +5,10 @@ Python controls identity checks, representative authorization, claim ownership,
 and transitions through `VERIFY_ID → RESOLVE_INTENT → PROCESS_CASE → POST_PROCESS`.
 The model interprets customer language and writes answers using authorized records.
 
+## GitHub Repository
+
+Source code, Docker setup, and local installation instructions are available on [GitHub](https://github.com/arejith/SOP-Guided_Conversational_Agent).
+
 ## Live Demo
 
 Try the [SOP-Guided Conversational Agent](https://sop-guided-conversational-agent.onrender.com/).
