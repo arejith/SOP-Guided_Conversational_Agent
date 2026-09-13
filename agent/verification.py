@@ -8,7 +8,7 @@ This module defines:
 """
 
 import re
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 from services.data_service import InsuranceDataService
@@ -145,8 +145,7 @@ class IdentityVerifier:
                     stored_values.extend(aliases)
 
             field_matches = any(
-                provided_value
-                == self._normalize_value(field_name, stored_value)
+                provided_value == self._normalize_value(field_name, stored_value)
                 for stored_value in stored_values
             )
 
@@ -204,6 +203,36 @@ class IdentityVerifier:
             return digits
 
         if field_name == "dob":
+            # Unambiguous English month names are accepted without guessing
+            # the locale of numeric dates such as 03/04/1985.
+            natural = re.sub(r"(?<=\d)(st|nd|rd|th)\b", "", value, flags=re.I)
+            natural = " ".join(natural.replace(",", " ").split())
+            # Models sometimes return ISO dates with an ordinal suffix or
+            # month-first punctuation; normalize those before strict parsing.
+            natural = (
+                natural.replace("-", " ")
+                if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value)
+                else natural
+            )
+            iso_prefix = re.fullmatch(
+                r"(\d{4}-\d{2}-\d{2})(?:[\sTtZz0-9:.,/+\-]+)?", value
+            )
+            if iso_prefix:
+                try:
+                    return date.fromisoformat(iso_prefix.group(1)).isoformat()
+                except ValueError:
+                    return None
+            for pattern in (
+                "%B %d %Y",
+                "%b %d %Y",
+                "%d %B %Y",
+                "%d %b %Y",
+                "%Y %m %d",
+            ):
+                try:
+                    return datetime.strptime(natural, pattern).date().isoformat()
+                except ValueError:
+                    pass
             if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
                 return None
 

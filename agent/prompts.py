@@ -7,7 +7,6 @@ This module defines:
         and returning structured information.
 """
 
-
 EXTRACTION_PROMPT = """
 You extract information for an insurance customer-support agent.
 
@@ -23,6 +22,13 @@ Identity and caller-role rules:
 - Use representative when the customer clearly says they are acting
   for another person.
 - If the caller's role is unclear, use null and ask who is calling.
+- A role omitted on an ordinary partial reply preserves the remembered role.
+- Set identity_ambiguous=true for conflicting caller/policyholder ownership,
+  including "I am Margaret Chen. I am her son." Ask who is speaking and
+  who holds the policy; do not assign either name by guessing.
+- Set identity_context_changed=true only when the speaker or policyholder
+  is actually being replaced. A typo correction or formatting change is
+  not a new person. Never carry the previous person's PII into a new identity.
 - Extract role and representative details from the current message,
   using earlier context to interpret references.
 - Do not invent representative details.
@@ -37,6 +43,10 @@ Identity and caller-role rules:
   ask whether it belongs to the caller or the policyholder.
 - Never copy identity values from assistant messages.
 - Never guess missing identity details.
+- Inspect every explicitly supplied permitted field, especially SSN last four.
+- Do not extract quoted examples, negated, withdrawn, hypothetical or unrelated
+  values. For unresolved conflicting values, omit AND clear that field and ask
+  a focused question. Never truncate a full SSN to its last four digits.
 
 Authorization rules:
 - Extracting a representative's details does not authorize claim access.
@@ -52,11 +62,17 @@ General extraction rules:
 - Extract information supplied or explicitly corrected in the current
   customer message.
 - Use earlier messages to understand references and short replies.
+- Use pending_field and pending_question to interpret short replies such as
+  a natural date or four digits. An alternative clearly labelled field is
+  also allowed. An unlabelled value with multiple possible meanings needs
+  clarification. Never guess whether an ambiguous numeric date is US or EU.
 - A customer-reported claim status is only a hint, not a confirmed fact.
 - Use null for information not supplied or not reasonably clear.
 - Use an empty identity_fields object when no policyholder identity
   information is supplied.
 - Omit unknown identity fields instead of giving them null values.
+- When the supplied JSON schema requires identity keys, use null for omitted
+  values; Python removes these null placeholders before merging memory.
 - A null value preserves earlier memory; it does not retract it.
 
 Corrections and retractions:
@@ -86,6 +102,15 @@ Field rules:
 - Set human_requested to true only when the customer requests human
   assistance.
 - Do not infer email consent. The controller handles consent separately.
+- Set general_question to verification_reason, identity_options, or
+  document_preparation only for a general question that can be answered
+  without any claim record. Otherwise use null. A request for the documents
+  missing from MY claim is not general document preparation.
+- Set conversation_action=wrap_up when the customer clearly finishes the
+  discussion or requests/skips an email summary with no substantive question.
+  A substantive follow-up, even with thanks or conditional consent, is continue.
+- An email address supplied for a summary is not an identity correction.
+  Do not put it in identity_fields unless clearly offered for verification.
 
 Examples:
 - "I'm Margaret Chen, the policyholder" supplies caller_role=policyholder
@@ -143,7 +168,11 @@ Return every top-level field in this structure:
   "scope": "unclear",
   "human_requested": false,
   "clarification_question": null,
-  "clear_fields": []
+  "clear_fields": [],
+  "identity_ambiguous": false,
+  "identity_context_changed": false,
+  "general_question": null,
+  "conversation_action": "continue"
 }
 
 identity_fields may contain only:
@@ -230,6 +259,9 @@ Rules:
 - Compare fixed deadlines with the supplied current date.
 - Never imply an expired deadline remains open.
 - Never suggest that generic submission guidance extends a fixed deadline.
+- An expired deadline alone does not establish that late appeals are forbidden.
+  If late-appeal rules are absent, say they are unknown and suggest human
+  clarification. Do not promise acceptance or reconsideration.
 - For missing or conflicting information, state the limitation and
   suggest human clarification.
 - Do not claim to have changed a claim or submitted documents.
@@ -256,6 +288,9 @@ Choose exactly one action:
 Rules:
 - send means explicit agreement to the email offer. A clear yes
   immediately answering that offer can count as agreement.
+- An explicit request to send an email summary also counts without a prior
+  offer. A bare yes without an email offer is unclear. Finishing the discussion
+  or saying thanks is unclear until the email choice is made.
 - skip means explicit refusal of the email offer.
 - followup means another insurance question, case correction, or request
   requiring discussion before completing the summary.
@@ -292,6 +327,7 @@ Rules:
 - Do not invent actions, approvals, document submissions, or deadlines.
 - Compare deadlines with the supplied current date.
 - Do not imply an expired deadline remains open.
+- Do not infer that late appeals are prohibited from the deadline alone.
 - Distinguish recommended next steps from actions already completed.
 - Do not claim an email was sent.
 - Do not include unrelated parts of the conversation.

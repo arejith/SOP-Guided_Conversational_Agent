@@ -57,6 +57,12 @@ class ConversationState:
         out_of_scope_attempts: Number of consecutive unrelated-question attempts.
         email_consent: True to send, False to skip, or None if undecided.
         escalation_required: Whether human assistance is needed.
+        pending_question: Last focused question used to interpret short replies.
+        pending_field: Field requested by that question, when known.
+        verification_attempts: Count of unsuccessful verification turns.
+        clarification_attempts: Consecutive semantic clarification requests.
+        summary_delivery_status: not_requested, skipped, or preview_generated.
+        summary_preview: Generated body; never evidence of actual delivery.
     """
 
     phase: Phase = Phase.VERIFY_ID
@@ -84,6 +90,12 @@ class ConversationState:
     out_of_scope_attempts: int = 0
     email_consent: bool | None = None
     escalation_required: bool = False
+    pending_question: str | None = None
+    pending_field: str | None = None
+    verification_attempts: int = 0
+    clarification_attempts: int = 0
+    summary_delivery_status: str = "not_requested"
+    summary_preview: str | None = None
 
     @property
     def is_verified(self) -> bool:

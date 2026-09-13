@@ -9,25 +9,29 @@ This module defines:
         claim access, scope handling, and email-summary consent.
 """
 
+import logging
 from copy import deepcopy
 from dataclasses import fields
+from datetime import datetime
 from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 from openai import OpenAIError
 
 from agent.case_handler import CaseHandler
-from agent.extraction import extract_customer_information
+from agent.extraction import extract_customer_information, extraction_schema
 from agent.memory import remember_customer_information
 from agent.post_process import PostProcessHandler
-
-from agent.state import ConversationState, Phase, CallerRole
+from agent.state import CallerRole, ConversationState, Phase
 from agent.verification import IdentityVerifier
-from services.data_service import InsuranceDataService
-from services.llm_service import LLMService
 from services.authorization_service import (
     RepresentativeAuthorizationService,
 )
+from services.data_service import InsuranceDataService
+from services.errors import ModelResponseError
+from services.llm_service import LLMService
+
+logger = logging.getLogger(__name__)
 
 
 class GraphState(TypedDict):
@@ -87,8 +91,6 @@ class InsuranceSOPGraph:
 
         self.graph = self._build_graph()
 
-        
-
     def handle_message(
         self,
         conversation: ConversationState,
@@ -118,6 +120,8 @@ class InsuranceSOPGraph:
 
         # Prevent failed requests from leaving partial state updates.
         working = deepcopy(conversation)
+        authorization_before = deepcopy(self.authorization_service.requests)
+        self._security_invalidated = False
 
         try:
             result = self.graph.invoke(
@@ -128,12 +132,27 @@ class InsuranceSOPGraph:
                     "response": "",
                 }
             )
-        except (OpenAIError, ValueError, RuntimeError):
-            #return (
-            #    "I’m sorry, I couldn’t complete that step. "
-            #    "Please try again. Your previous progress has been kept."
-            #)
-            raise
+        except Exception as error:
+            # Simulator mutations participate in the same turn transaction.
+            self.authorization_service.requests = authorization_before
+            if self._security_invalidated:
+                # A failed answer must not restore a prior person's access.
+                clean = ConversationState()
+                for item in fields(ConversationState):
+                    setattr(conversation, item.name, getattr(clean, item.name))
+            if not isinstance(error, (OpenAIError, ModelResponseError)):
+                raise
+            # Log type and phase only: exceptions can contain credentials or PII.
+            logger.warning(
+                "Model step failed: phase=%s error_type=%s",
+                working.phase.value,
+                type(error).__name__,
+            )
+            return "I’m sorry, I couldn’t complete that step. Please try again. " + (
+                "We need to verify the current caller before continuing."
+                if self._security_invalidated
+                else "Your previous progress has been kept."
+            )
 
         updated = result["conversation"]
         response = result["response"]
@@ -197,16 +216,13 @@ class InsuranceSOPGraph:
             "verify_id",
             "resolve_intent",
             "post_process",
+            "process_case",
         ):
             workflow.add_conditional_edges(
                 node_name,
                 self._route,
                 routes,
             )
-
-        # Processing produces an answer and a summary offer.
-        # Consent or another question arrives on the next turn.
-        workflow.add_edge("process_case", END)
 
         return workflow.compile()
 
@@ -261,6 +277,7 @@ class InsuranceSOPGraph:
         }
 
         return phase_routes[conversation.phase]
+
     def _extract_node(
         self,
         state: GraphState,
@@ -268,141 +285,199 @@ class InsuranceSOPGraph:
         """Extract information and safely update the caller context."""
 
         conversation = state["conversation"]
-
-        extracted = extract_customer_information(
-            conversation,
-            state["message"],
-            self.llm_service.ask_model,
+        normalized_message = " ".join(state["message"].casefold().split())
+        explicit_summary_choice = (
+            conversation.phase == Phase.POST_PROCESS
+            and normalized_message.strip(" .,!?")
+            in {
+                "yes",
+                "yes send",
+                "yes send it",
+                "yes please send",
+                "yes please send it",
+                "yes send the email",
+                "yes send the email summary",
+                "send the email summary",
+                "please send the email summary",
+                "no",
+                "no thanks",
+                "skip",
+                "skip it",
+                "skip the email",
+                "skip the email summary",
+                "do not send it",
+                "don't send it",
+            }
         )
+        if explicit_summary_choice:
+            extracted = {
+                "identity_fields": {},
+                "caller_role": None,
+                "representative_name": None,
+                "representative_relationship": None,
+                "intent": None,
+                "case_type": None,
+                "month": None,
+                "year": None,
+                "reported_status": None,
+                "case_id": None,
+                "emotion": None,
+                "scope": "in_scope",
+                "human_requested": False,
+                "clarification_question": None,
+                "clear_fields": [],
+                "identity_ambiguous": False,
+                "identity_context_changed": False,
+                "general_question": None,
+                "conversation_action": "wrap_up",
+            }
+        else:
+            extracted = extract_customer_information(
+                conversation,
+                state["message"],
+                lambda prompt: self.llm_service.ask_model(
+                    prompt, schema=extraction_schema()
+                ),
+            )
 
         clear_fields = extracted["clear_fields"]
-
+        normalize = IdentityVerifier._normalize_value
         identity_changed = any(
-            conversation.identity_fields.get(name) != value
+            normalize(name, conversation.identity_fields.get(name)) != value
             for name, value in extracted["identity_fields"].items()
         )
-
         identity_retracted = any(
-            name.startswith("identity_fields.")
-            for name in clear_fields
+            name.startswith("identity_fields.") for name in clear_fields
         )
-
         supplied_role = extracted["caller_role"]
-
-        new_role = (
-            CallerRole(supplied_role)
-            if supplied_role is not None
-            else None
-        )
-
         role_changed = (
-            new_role is not None
-            and new_role != conversation.caller_role
-        )
-
-        representative_fields = (
-            "representative_name",
-            "representative_relationship",
-        )
-
+            supplied_role is not None
+            and supplied_role != conversation.caller_role.value
+            and conversation.caller_role != CallerRole.UNKNOWN
+        ) or "caller_role" in clear_fields
         representative_changed = any(
-            extracted[name] is not None
-            and extracted[name] != getattr(conversation, name)
-            for name in representative_fields
-        )
-
-        caller_context_retracted = any(
-            name in {
-                "caller_role",
-                "representative_name",
-                "representative_relationship",
-            }
-            for name in clear_fields
-        )
-
-        protected_context_exists = (
-            conversation.is_verified
-            or conversation.authorization_request_id is not None
-        )
-
-        security_context_changed = (
-            identity_changed
-            or identity_retracted
-            or role_changed
-            or representative_changed
-            or caller_context_retracted
-        )
-
-        # A caller switch can also happen before verification.
-        established_role_changed = (
-            conversation.caller_role != CallerRole.UNKNOWN
-            and (
-                role_changed
-                or "caller_role" in clear_fields
-            )
-        )
-
-        established_representative_changed = any(
             getattr(conversation, name) is not None
             and (
                 name in clear_fields
                 or (
                     extracted[name] is not None
-                    and extracted[name] != getattr(conversation, name)
+                    and " ".join(extracted[name].casefold().split())
+                    != " ".join(getattr(conversation, name).casefold().split())
                 )
             )
-            for name in representative_fields
+            for name in ("representative_name", "representative_relationship")
         )
-
-        reset_context = (
-            protected_context_exists and security_context_changed
-        ) or established_role_changed or established_representative_changed
-
-        if reset_context:
-            # Drop access credentials, previous identity, claim selection,
-            # and history. Collect the new caller context explicitly.
-            previous_attempts = conversation.out_of_scope_attempts
-            previous_escalation = conversation.escalation_required
-
-            conversation = ConversationState(
-                out_of_scope_attempts=previous_attempts,
-                escalation_required=previous_escalation,
+        new_person = (
+            role_changed
+            or representative_changed
+            or (
+                extracted["identity_context_changed"]
+                and any(
+                    name in extracted["identity_fields"]
+                    for name in ("name", "policy_number")
+                )
             )
-
-        remember_customer_information(
-            conversation,
-            extracted,
+            or extracted["identity_ambiguous"]
+            or any(
+                name in conversation.identity_fields
+                and name in extracted["identity_fields"]
+                and normalize(name, conversation.identity_fields[name])
+                != extracted["identity_fields"][name]
+                for name in ("name", "policy_number")
+            )
         )
+        if new_person:
+            previous_clarifications = conversation.clarification_attempts
+            self._security_invalidated = True
+            if conversation.authorization_request_id:
+                self.authorization_service.requests.pop(
+                    conversation.authorization_request_id, None
+                )
+            conversation = ConversationState()
+            conversation.clarification_attempts = previous_clarifications
+            if extracted["identity_ambiguous"]:
+                extracted["identity_fields"] = {}
+                extracted["caller_role"] = None
+                extracted["representative_name"] = None
+                extracted["representative_relationship"] = None
+                extracted["clarification_question"] = extracted[
+                    "clarification_question"
+                ] or ("Who is speaking, and who is the policyholder?")
+        elif identity_changed or identity_retracted:
+            if conversation.is_verified or conversation.authorization_request_id:
+                self._security_invalidated = True
+                if conversation.authorization_request_id:
+                    self.authorization_service.requests.pop(
+                        conversation.authorization_request_id, None
+                    )
+                conversation.verified_party_id = None
+                conversation.authorization_request_id = None
+                conversation.selected_case_id = None
+                conversation.phase = Phase.VERIFY_ID
+                conversation.messages = []
+                conversation.email_consent = None
+                conversation.summary_preview = None
+                conversation.summary_delivery_status = "not_requested"
+
+        # Harmless formatting changes do not invalidate existing access.
+        for name, value in list(conversation.identity_fields.items()):
+            normalized = normalize(name, value)
+            if normalized is not None:
+                conversation.identity_fields[name] = normalized
+        for name in ("representative_name", "representative_relationship"):
+            if extracted[name] and getattr(conversation, name):
+                if " ".join(extracted[name].casefold().split()) == " ".join(
+                    getattr(conversation, name).casefold().split()
+                ):
+                    extracted[name] = getattr(conversation, name)
+
+        hint_changed = any(
+            (
+                extracted[source] is not None
+                and extracted[source] != getattr(conversation, target)
+            )
+            or source in clear_fields
+            for source, target in (
+                ("case_id", "remembered_case_id"),
+                ("case_type", "remembered_case_type"),
+                ("month", "remembered_month"),
+                ("year", "remembered_year"),
+            )
+        )
+        remember_customer_information(conversation, extracted)
+        if hint_changed and conversation.selected_case_id:
+            conversation.selected_case_id = None
+            conversation.phase = Phase.RESOLVE_INTENT
 
         response = ""
-
-        if conversation.escalation_required:
+        if extracted["human_requested"]:
             response = (
-                "This demo has recorded the need for human assistance, "
-                "but it cannot connect a live representative. "
-                "Identity and any required authorization checks "
-                "would still apply."
+                "This demo has recorded your request for human assistance, but it "
+                "cannot connect a live representative. Identity and any required "
+                "authorization checks would still apply. You may also continue here."
             )
-
         elif extracted["scope"] == "out_of_scope":
             conversation.out_of_scope_attempts += 1
-
+            response = "I can help with insurance claims and related support, but I can’t answer unrelated questions here."
             if conversation.out_of_scope_attempts >= 3:
-                conversation.escalation_required = True
-
-                response = (
-                    "I can help with insurance-support questions only. "
-                    "Would you like help from a human representative? "
-                    "Live transfer is not connected in this demo."
-                )
-            else:
-                response = (
-                    "I can help with insurance claims and related support, "
-                    "but I can’t answer unrelated questions here."
-                )
-
+                response += " Would you like human assistance? Live transfer is not connected in this demo."
         else:
             conversation.out_of_scope_attempts = 0
+            conversation.escalation_required = False
+            if extracted["clarification_question"]:
+                conversation.clarification_attempts += 1
+                conversation.pending_question = extracted["clarification_question"]
+                conversation.pending_field = (
+                    "caller_role" if extracted["identity_ambiguous"] else None
+                )
+                response = conversation.pending_question
+                if conversation.clarification_attempts >= 3:
+                    response += " If this is getting difficult, you can request human assistance. Live transfer is not connected in this demo."
+            else:
+                conversation.clarification_attempts = 0
+                if not extracted["general_question"]:
+                    conversation.pending_question = None
+                    conversation.pending_field = None
 
         return {
             "conversation": conversation,
@@ -420,35 +495,45 @@ class InsuranceSOPGraph:
         conversation.phase = Phase.VERIFY_ID
 
         empathy = {
-            "frustration": (
-                "I understand these extra steps can be frustrating. "
-            ),
-            "anger": (
-                "I hear that you’re upset, and I want to help. "
-            ),
+            "frustration": ("I understand these extra steps can be frustrating. "),
+            "anger": ("I hear that you’re upset, and I want to help. "),
             "anxiety": (
                 "I understand this may feel worrying. "
                 "We can take it one step at a time. "
             ),
-            "confusion": (
-                "I’m happy to explain what we need. "
-            ),
-            "refusal": (
-                "You can choose not to continue with these checks. "
-            ),
+            "confusion": ("I’m happy to explain what we need. "),
+            "refusal": ("You can choose not to continue with these checks. "),
         }.get(conversation.emotion, "")
 
-        if conversation.caller_role == CallerRole.UNKNOWN:
+        general = state["extracted"]["general_question"]
+        if general:
+            public_answers = {
+                "verification_reason": "Verification protects private claim information. We need three matching permitted identity details before discussing a claim; representatives also need authorization.",
+                "identity_options": "You may use full name, date of birth, phone with country code, email, or SSN last four. Choose three. A policy number can help locate the policy but does not count. Please do not provide a full SSN.",
+                "document_preparation": self.data_service.document_guidance[
+                    "default_guidance"
+                ]["en"],
+            }
             return {
-                "response": empathy + (
+                "response": empathy
+                + public_answers[general]
+                + " This is general guidance; claim-specific help requires verification."
+            }
+
+        if conversation.caller_role == CallerRole.UNKNOWN:
+            conversation.pending_field = "caller_role"
+            conversation.pending_question = (
+                "Are you the policyholder, or calling for someone else?"
+            )
+            return {
+                "response": empathy
+                + (
                     "Are you the policyholder, or are you calling "
                     "on behalf of someone else?"
                 )
             }
 
-        is_representative = (
-            conversation.caller_role == CallerRole.REPRESENTATIVE
-        )
+        is_representative = conversation.caller_role == CallerRole.REPRESENTATIVE
 
         if is_representative:
             missing_details = []
@@ -457,13 +542,20 @@ class InsuranceSOPGraph:
                 missing_details.append("your full name")
 
             if not conversation.representative_relationship:
-                missing_details.append(
-                    "your relationship to the policyholder"
-                )
+                missing_details.append("your relationship to the policyholder")
 
             if missing_details:
+                conversation.pending_field = (
+                    "representative_name"
+                    if not conversation.representative_name
+                    else "representative_relationship"
+                )
+                conversation.pending_question = (
+                    "Please provide " + " and ".join(missing_details) + "."
+                )
                 return {
-                    "response": empathy + (
+                    "response": empathy
+                    + (
                         "Please provide "
                         + " and ".join(missing_details)
                         + ". These are your details; the identity "
@@ -474,7 +566,8 @@ class InsuranceSOPGraph:
         # A refusal must not trigger an authorization-status advance.
         if conversation.emotion == "refusal":
             return {
-                "response": empathy + (
+                "response": empathy
+                + (
                     "I can’t disclose claim details without the required "
                     "identity and authorization checks. You can use another "
                     "permitted identity field, ask the policyholder to "
@@ -483,28 +576,50 @@ class InsuranceSOPGraph:
             }
 
         if not conversation.is_verified:
-            policyholder = (
-                self.identity_verifier.find_verified_policyholder(
-                    conversation.identity_fields
-                )
+            policyholder = self.identity_verifier.find_verified_policyholder(
+                conversation.identity_fields
             )
 
             if policyholder is None:
-                subject = (
-                    "the policyholder’s"
-                    if is_representative
-                    else "your"
-                )
+                subject = "the policyholder’s" if is_representative else "your"
 
-                return {
-                    "response": empathy + (
-                        "To protect private claim information, I need "
-                        f"three matching details from {subject} full name, "
-                        "date of birth, phone number including country code, "
-                        "email, or SSN last four. "
-                        "You can choose which three to provide."
-                    )
+                conversation.verification_attempts += 1
+                labels = {
+                    "name": "full name",
+                    "dob": "date of birth",
+                    "phone": "phone number including country code",
+                    "email": "email address",
+                    "id_last4": "SSN last four",
                 }
+                available = [
+                    name for name in labels if name not in conversation.identity_fields
+                ]
+                supplied_count = sum(
+                    name in conversation.identity_fields for name in labels
+                )
+                target = available[0] if available else "name"
+                conversation.pending_field = target
+                question = f"Could you provide {subject} {labels[target]}?"
+                if available[1:]:
+                    question += (
+                        " You can use "
+                        + " or ".join(labels[name] for name in available[1:])
+                        + " instead."
+                    )
+                if supplied_count < 3:
+                    question = (
+                        "To protect claim information, I need three permitted identity details. "
+                        + question
+                    )
+                else:
+                    question = (
+                        "I couldn’t verify the information provided. Please check your details or try another permitted field. "
+                        + question
+                    )
+                if conversation.verification_attempts >= 3:
+                    question += " If you prefer, you can request human assistance; live transfer is not connected here."
+                conversation.pending_question = question
+                return {"response": empathy + question}
 
             conversation.verified_party_id = policyholder["party_id"]
 
@@ -538,7 +653,8 @@ class InsuranceSOPGraph:
 
                 return {
                     "conversation": conversation,
-                    "response": empathy + (
+                    "response": empathy
+                    + (
                         "I couldn’t establish your representative relationship "
                         "from the information provided. I can’t disclose claim "
                         "details. Human assistance is needed to review access; "
@@ -562,7 +678,8 @@ class InsuranceSOPGraph:
         if status == "pending":
             return {
                 "conversation": conversation,
-                "response": empathy + (
+                "response": empathy
+                + (
                     "The policyholder identity details have been verified, "
                     "but authorization for you to access the claim is pending. "
                     "This demo simulates policyholder approval; it has not "
@@ -590,9 +707,9 @@ class InsuranceSOPGraph:
 
             return {
                 "conversation": conversation,
-                "response": empathy + (
-                    explanation
-                    + " I can’t disclose claim details. "
+                "response": empathy
+                + (
+                    explanation + " I can’t disclose claim details. "
                     "The policyholder can contact support directly, "
                     "or a human representative can review authorization. "
                     "Live transfer is not connected in this demo."
@@ -609,6 +726,15 @@ class InsuranceSOPGraph:
 
         conversation = state["conversation"]
         party_id = self._require_verified(conversation)
+
+        # An authorization-only follow-up is a controller action, not a new
+        # intent. Preserve the request captured before authorization completed.
+        recheck_text = " ".join(state["message"].casefold().split())
+        is_authorization_recheck = "authorization" in recheck_text and any(
+            word in recheck_text for word in ("again", "check", "status", "approved")
+        )
+        if is_authorization_recheck and conversation.remembered_intent is None:
+            conversation.remembered_intent = "general_claim_question"
 
         if conversation.remembered_intent == "portal_support":
             return {
@@ -642,6 +768,14 @@ class InsuranceSOPGraph:
                 )
             }
 
+        explicit_id = conversation.remembered_case_id
+        if explicit_id and not any(
+            claim["case_id"].casefold() == explicit_id.casefold() for claim in claims
+        ):
+            return {
+                "response": "That claim reference does not match the claims available under your verified record. Please check the reference or describe the claim."
+            }
+
         decision = self.case_handler.select_case(
             conversation=conversation,
             message=state["message"],
@@ -649,7 +783,47 @@ class InsuranceSOPGraph:
         )
 
         if decision["case_id"] is None:
-            return {"response": decision["question"]}
+            # Authorization rechecks are continuation turns. If the model
+            # declines to repeat its earlier case proposal, use the already
+            # remembered, unambiguous hints only when they identify one owned
+            # claim; this does not broaden access or override a claim ID.
+            if is_authorization_recheck:
+                narrowed = claims
+                if conversation.remembered_case_type:
+                    narrowed = [
+                        claim
+                        for claim in narrowed
+                        if claim.get("case_type") == conversation.remembered_case_type
+                    ]
+                if conversation.remembered_month:
+                    narrowed = [
+                        claim
+                        for claim in narrowed
+                        if datetime.fromisoformat(claim["created_at"]).strftime("%B")
+                        == conversation.remembered_month
+                    ]
+                if conversation.remembered_year:
+                    narrowed = [
+                        claim
+                        for claim in narrowed
+                        if int(claim["created_at"][:4]) == conversation.remembered_year
+                    ]
+                if conversation.remembered_status_hint:
+                    narrowed = [
+                        claim
+                        for claim in narrowed
+                        if claim.get("status") == conversation.remembered_status_hint
+                    ]
+                if len(narrowed) == 1:
+                    decision = {"case_id": narrowed[0]["case_id"], "question": None}
+            if decision["case_id"] is None:
+                conversation.pending_question = decision["question"]
+                return {"response": decision["question"]}
+
+        if explicit_id and decision["case_id"].casefold() != explicit_id.casefold():
+            raise ModelResponseError(
+                "Selected claim conflicts with the explicit reference."
+            )
 
         # The handler proposes a case; the controller checks ownership.
         claim = self.data_service.find_claim_for_party(
@@ -669,9 +843,14 @@ class InsuranceSOPGraph:
         self,
         state: GraphState,
     ) -> dict[str, Any]:
-        """Check ownership, generate an answer, and offer a summary."""
+        """Answer follow-ups and offer a summary only when wrapping up."""
 
         conversation = state["conversation"]
+
+        if state["extracted"]["conversation_action"] == "wrap_up":
+            self._require_verified(conversation)
+            conversation.phase = Phase.POST_PROCESS
+            return self._post_process_node(state)
 
         # Recheck ownership before passing claim details to the handler.
         claim = self._get_selected_claim(conversation)
@@ -684,17 +863,7 @@ class InsuranceSOPGraph:
             guidance=self.data_service.document_guidance,
         )
 
-        conversation.phase = Phase.POST_PROCESS
-
-        return {
-            "conversation": conversation,
-            "response": answer + (
-                "\n\nWould you like an email summary of what we discussed "
-                "and the next steps, or would you prefer to skip it? "
-                "Email delivery is simulated in this demo. "
-                "You can also ask another claim question."
-            ),
-        }
+        return {"conversation": conversation, "response": answer}
 
     def _post_process_node(
         self,
@@ -708,18 +877,23 @@ class InsuranceSOPGraph:
         action = self.post_process_handler.interpret_consent(
             conversation=conversation,
             message=state["message"],
-            )
+        )
 
         if action == "followup":
             # Re-resolve the case because the customer may have supplied
             # a different request or corrected earlier case hints.
-            conversation.selected_case_id = None
-            conversation.phase = Phase.RESOLVE_INTENT
+            conversation.phase = (
+                Phase.PROCESS_CASE
+                if conversation.selected_case_id
+                else Phase.RESOLVE_INTENT
+            )
+            state["extracted"]["conversation_action"] = "continue"
 
             return {"conversation": conversation}
 
         if action == "skip":
             conversation.email_consent = False
+            conversation.summary_delivery_status = "skipped"
 
             return {
                 "conversation": conversation,
@@ -730,10 +904,14 @@ class InsuranceSOPGraph:
             }
 
         if action == "unclear":
+            conversation.pending_field = "email_consent"
+            conversation.pending_question = (
+                "Would you like the email summary, or should we skip it?"
+            )
             return {
                 "response": (
-                    "Would you like the email summary, "
-                    "or should we skip it?"
+                    "Would you like an email summary of what we discussed and the next steps, "
+                    "or should we skip it? Email delivery is simulated in this demo."
                 )
             }
 
@@ -751,6 +929,8 @@ class InsuranceSOPGraph:
 
         # Record consent separately from email delivery.
         conversation.email_consent = True
+        conversation.summary_delivery_status = "preview_generated"
+        conversation.summary_preview = body
 
         return {
             "conversation": conversation,
@@ -760,6 +940,7 @@ class InsuranceSOPGraph:
                 f"\n\n{body}"
             ),
         }
+
     def _require_verified(
         self,
         conversation: ConversationState,
@@ -804,9 +985,7 @@ class InsuranceSOPGraph:
         )
 
         if not approved:
-            raise ValueError(
-                "Representative authorization has not been approved."
-            )
+            raise ValueError("Representative authorization has not been approved.")
 
         return party_id
 

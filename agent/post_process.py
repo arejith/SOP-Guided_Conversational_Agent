@@ -7,14 +7,17 @@ This module defines:
         summary previews without sending emails or changing state.
 """
 
+import re
 from datetime import date
 from typing import Any
 
+from agent.case_handler import applicable_guidance
 from agent.prompts import (
     EMAIL_CONSENT_PROMPT,
     EMAIL_SUMMARY_PROMPT,
 )
 from agent.state import ConversationState
+from services.errors import ModelResponseError
 from services.llm_service import LLMService
 
 
@@ -55,6 +58,34 @@ class PostProcessHandler:
             ValueError: If the model returns an invalid decision.
         """
 
+        normalized = " ".join(re.sub(r"[^a-z0-9']+", " ", message.casefold()).split())
+        # These are explicit responses to the immediately preceding offer.
+        # Handling them locally prevents a harmless model omission from
+        # turning clear consent into an unnecessary clarification loop.
+        if normalized in {
+            "yes",
+            "yes send",
+            "yes send it",
+            "yes please send",
+            "yes please send it",
+            "yes send the email",
+            "yes send the email summary",
+            "send the email summary",
+            "please send the email summary",
+        }:
+            return "send"
+        if normalized in {
+            "no",
+            "no thanks",
+            "skip",
+            "skip it",
+            "skip the email",
+            "skip the email summary",
+            "do not send it",
+            "don't send it",
+        }:
+            return "skip"
+
         decision = self.llm_service.ask_json(
             EMAIL_CONSENT_PROMPT,
             {
@@ -64,7 +95,7 @@ class PostProcessHandler:
         )
 
         if set(decision) != {"action"}:
-            raise ValueError("Invalid email-consent response.")
+            raise ModelResponseError("Invalid email-consent response.")
 
         action = decision["action"]
 
@@ -76,7 +107,7 @@ class PostProcessHandler:
         }
 
         if not isinstance(action, str) or action not in allowed_actions:
-            raise ValueError("Invalid email-consent decision.")
+            raise ModelResponseError("Invalid email-consent decision.")
 
         return action
 
@@ -107,12 +138,12 @@ class PostProcessHandler:
                 "today": date.today().isoformat(),
                 "conversation": conversation.messages,
                 "claim": claim,
-                "guidance": guidance,
+                "guidance": applicable_guidance(claim, guidance),
             },
         )
 
         if set(result) != {"summary"}:
-            raise ValueError("Invalid email-summary response.")
+            raise ModelResponseError("Invalid email-summary response.")
 
         return self.llm_service.required_text(
             result,

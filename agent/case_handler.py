@@ -15,7 +15,49 @@ from agent.prompts import (
     CLAIM_ANSWER_PROMPT,
 )
 from agent.state import ConversationState
+from services.errors import ModelResponseError
 from services.llm_service import LLMService
+
+
+def applicable_guidance(
+    claim: dict[str, Any], guidance: dict[str, Any]
+) -> dict[str, Any]:
+    """Limit answer and summary context to guidance relevant to this record."""
+
+    documents = claim.get("documents_needed", [])
+    aliases = {"office note": "treating provider office note"}
+    document_keys = {aliases.get(name, name) for name in documents}
+    selected = {
+        "default_guidance": guidance.get("default_guidance", {}),
+        "case_type_guidance": guidance.get("case_type_guidance", {}).get(
+            claim.get("case_type"), {}
+        ),
+        "document_guidance": {
+            name: value
+            for name, value in guidance.get("document_guidance", {}).items()
+            if name in document_keys
+        },
+    }
+    if documents:
+        selected["document_alternative_guidance"] = {
+            name: value
+            for name, value in guidance.get("document_alternative_guidance", {}).items()
+            if name == "default" or name in document_keys
+        }
+        selected["claim_followup_guidance"] = [
+            item
+            for item in guidance.get("claim_followup_guidance", [])
+            # A generic relative timing instruction must not compete with a
+            # recorded fixed appeal deadline.
+            if not (
+                claim.get("appeal_deadline")
+                and item.get("topic") == "submission_timing"
+            )
+        ]
+        selected["claim_followup_settings"] = guidance.get(
+            "claim_followup_settings", {}
+        )
+    return selected
 
 
 class CaseHandler:
@@ -60,10 +102,8 @@ class CaseHandler:
 
         decision = self.llm_service.ask_json(
             CASE_SELECTION_PROMPT,
-            {   "access_context": {
-                             "claim_access_authorized": True,
-                                "source": "SOP controller access and ownership checks",
-                                },
+            {
+                "access_context": {"claim_access_authorized": True},
                 "request": message,
                 "recent_messages": conversation.messages[-8:],
                 "intent": conversation.remembered_intent,
@@ -72,9 +112,7 @@ class CaseHandler:
                     "case_type": conversation.remembered_case_type,
                     "month": conversation.remembered_month,
                     "year": conversation.remembered_year,
-                    "reported_status": (
-                        conversation.remembered_status_hint
-                    ),
+                    "reported_status": (conversation.remembered_status_hint),
                 },
                 "candidates": [
                     {
@@ -92,7 +130,7 @@ class CaseHandler:
         )
 
         if set(decision) != {"case_id", "question"}:
-            raise ValueError("Invalid case-selection response.")
+            raise ModelResponseError("Invalid case-selection response.")
 
         case_id = decision["case_id"]
 
@@ -106,10 +144,10 @@ class CaseHandler:
             }
 
         if not isinstance(case_id, str) or not case_id.strip():
-            raise ValueError("Invalid selected case ID.")
+            raise ModelResponseError("Invalid selected case ID.")
 
         if decision["question"] is not None:
-            raise ValueError("Ambiguous case-selection response.")
+            raise ModelResponseError("Ambiguous case-selection response.")
 
         # This is only a proposal. The controller checks ownership.
         return {
@@ -145,6 +183,7 @@ class CaseHandler:
         result = self.llm_service.ask_json(
             CLAIM_ANSWER_PROMPT,
             {
+                "access_context": {"claim_access_authorized": True},
                 "today": date.today().isoformat(),
                 "request": message,
                 "intent": conversation.remembered_intent,
@@ -152,11 +191,11 @@ class CaseHandler:
                 "recent_messages": conversation.messages[-8:],
                 "claim": claim,
                 "field_definitions": field_definitions,
-                "guidance": guidance,
+                "guidance": applicable_guidance(claim, guidance),
             },
         )
 
         if set(result) != {"answer"}:
-            raise ValueError("Invalid claim-answer response.")
+            raise ModelResponseError("Invalid claim-answer response.")
 
         return self.llm_service.required_text(result, "answer")

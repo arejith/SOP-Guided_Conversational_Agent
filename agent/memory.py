@@ -11,7 +11,6 @@ from typing import Any
 
 from agent.state import CallerRole, ConversationState
 
-
 MEMORY_FIELDS = {
     "intent": "remembered_intent",
     "case_type": "remembered_case_type",
@@ -64,23 +63,15 @@ def remember_customer_information(
     )
 
     identity_retracted = any(
-        name.startswith("identity_fields.")
-        for name in clear_fields
+        name.startswith("identity_fields.") for name in clear_fields
     )
 
     # Convert the extracted role into the enum used by ConversationState.
     supplied_role = extracted["caller_role"]
 
-    new_role = (
-        CallerRole(supplied_role)
-        if supplied_role is not None
-        else None
-    )
+    new_role = CallerRole(supplied_role) if supplied_role is not None else None
 
-    role_changed = (
-        new_role is not None
-        and new_role != conversation.caller_role
-    )
+    role_changed = new_role is not None and new_role != conversation.caller_role
 
     representative_changed = any(
         extracted[source] is not None
@@ -88,10 +79,7 @@ def remember_customer_information(
         for source, destination in REPRESENTATIVE_FIELDS.items()
     )
 
-    caller_context_retracted = any(
-        name in CALLER_FIELDS
-        for name in clear_fields
-    )
+    caller_context_retracted = any(name in CALLER_FIELDS for name in clear_fields)
 
     security_context_changed = (
         identity_changed
@@ -102,8 +90,7 @@ def remember_customer_information(
     )
 
     protected_context_exists = (
-        conversation.is_verified
-        or conversation.authorization_request_id is not None
+        conversation.is_verified or conversation.authorization_request_id is not None
     )
 
     # Check before changing any state. The controller must explicitly
@@ -152,8 +139,7 @@ def remember_customer_information(
     # Do not retain a previous representative's details after the
     # caller's role is cleared or changed to policyholder.
     if (
-        role_changed
-        or "caller_role" in clear_fields
+        role_changed or "caller_role" in clear_fields
     ) and conversation.caller_role != CallerRole.REPRESENTATIVE:
         conversation.representative_name = None
         conversation.representative_relationship = None
