@@ -21,10 +21,13 @@ from agent.extraction import extract_customer_information
 from agent.memory import remember_customer_information
 from agent.post_process import PostProcessHandler
 
-from agent.state import ConversationState, Phase
+from agent.state import ConversationState, Phase, CallerRole
 from agent.verification import IdentityVerifier
 from services.data_service import InsuranceDataService
 from services.llm_service import LLMService
+from services.authorization_service import (
+    RepresentativeAuthorizationService,
+)
 
 
 class GraphState(TypedDict):
@@ -72,10 +75,19 @@ class InsuranceSOPGraph:
 
         self.data_service = data_service
         self.llm_service = llm_service
+
         self.identity_verifier = IdentityVerifier(data_service)
         self.case_handler = CaseHandler(llm_service)
         self.post_process_handler = PostProcessHandler(llm_service)
+
+        self.authorization_service = RepresentativeAuthorizationService(
+            data_service=data_service,
+            scenario="default",
+        )
+
         self.graph = self._build_graph()
+
+        
 
     def handle_message(
         self,
@@ -200,7 +212,7 @@ class InsuranceSOPGraph:
 
     def _route(self, state: GraphState) -> str:
         """
-        Choose the next node according to verification and phase.
+        Route according to identity, authorization, and workflow phase.
 
         Args:
             state: Current graph state.
@@ -214,9 +226,32 @@ class InsuranceSOPGraph:
 
         conversation = state["conversation"]
 
-        if not conversation.is_verified:
+        if (
+            not conversation.is_verified
+            or conversation.caller_role == CallerRole.UNKNOWN
+        ):
             conversation.phase = Phase.VERIFY_ID
             return "verify_id"
+
+        if conversation.caller_role == CallerRole.REPRESENTATIVE:
+            request_id = conversation.authorization_request_id
+            representative_name = conversation.representative_name
+            relationship = conversation.representative_relationship
+
+            if not request_id or not representative_name or not relationship:
+                conversation.phase = Phase.VERIFY_ID
+                return "verify_id"
+
+            approved = self.authorization_service.is_approved(
+                request_id=request_id,
+                verified_party_id=conversation.verified_party_id,
+                representative_name=representative_name,
+                relationship=relationship,
+            )
+
+            if not approved:
+                conversation.phase = Phase.VERIFY_ID
+                return "verify_id"
 
         phase_routes = {
             Phase.VERIFY_ID: "verify_id",
@@ -226,12 +261,11 @@ class InsuranceSOPGraph:
         }
 
         return phase_routes[conversation.phase]
-
     def _extract_node(
         self,
         state: GraphState,
     ) -> dict[str, Any]:
-        """Extract information, update memory, and apply scope gates."""
+        """Extract information and safely update the caller context."""
 
         conversation = state["conversation"]
 
@@ -241,22 +275,99 @@ class InsuranceSOPGraph:
             self.llm_service.ask_model,
         )
 
-        changed_identity = any(
+        clear_fields = extracted["clear_fields"]
+
+        identity_changed = any(
             conversation.identity_fields.get(name) != value
             for name, value in extracted["identity_fields"].items()
         )
 
-        retracted_identity = any(
+        identity_retracted = any(
             name.startswith("identity_fields.")
-            for name in extracted["clear_fields"]
+            for name in clear_fields
         )
 
-        if conversation.is_verified and (
-            changed_identity or retracted_identity
-        ):
-            # Require fresh verification without carrying forward
-            # the previous identity, claim selection, or history.
-            conversation = ConversationState()
+        supplied_role = extracted["caller_role"]
+
+        new_role = (
+            CallerRole(supplied_role)
+            if supplied_role is not None
+            else None
+        )
+
+        role_changed = (
+            new_role is not None
+            and new_role != conversation.caller_role
+        )
+
+        representative_fields = (
+            "representative_name",
+            "representative_relationship",
+        )
+
+        representative_changed = any(
+            extracted[name] is not None
+            and extracted[name] != getattr(conversation, name)
+            for name in representative_fields
+        )
+
+        caller_context_retracted = any(
+            name in {
+                "caller_role",
+                "representative_name",
+                "representative_relationship",
+            }
+            for name in clear_fields
+        )
+
+        protected_context_exists = (
+            conversation.is_verified
+            or conversation.authorization_request_id is not None
+        )
+
+        security_context_changed = (
+            identity_changed
+            or identity_retracted
+            or role_changed
+            or representative_changed
+            or caller_context_retracted
+        )
+
+        # A caller switch can also happen before verification.
+        established_role_changed = (
+            conversation.caller_role != CallerRole.UNKNOWN
+            and (
+                role_changed
+                or "caller_role" in clear_fields
+            )
+        )
+
+        established_representative_changed = any(
+            getattr(conversation, name) is not None
+            and (
+                name in clear_fields
+                or (
+                    extracted[name] is not None
+                    and extracted[name] != getattr(conversation, name)
+                )
+            )
+            for name in representative_fields
+        )
+
+        reset_context = (
+            protected_context_exists and security_context_changed
+        ) or established_role_changed or established_representative_changed
+
+        if reset_context:
+            # Drop access credentials, previous identity, claim selection,
+            # and history. Collect the new caller context explicitly.
+            previous_attempts = conversation.out_of_scope_attempts
+            previous_escalation = conversation.escalation_required
+
+            conversation = ConversationState(
+                out_of_scope_attempts=previous_attempts,
+                escalation_required=previous_escalation,
+            )
 
         remember_customer_information(
             conversation,
@@ -267,9 +378,10 @@ class InsuranceSOPGraph:
 
         if conversation.escalation_required:
             response = (
-                "This demo has recorded your request for human "
-                "assistance, but it cannot connect a live representative. "
-                "A representative would still need to verify your identity."
+                "This demo has recorded the need for human assistance, "
+                "but it cannot connect a live representative. "
+                "Identity and any required authorization checks "
+                "would still apply."
             )
 
         elif extracted["scope"] == "out_of_scope":
@@ -290,7 +402,6 @@ class InsuranceSOPGraph:
                 )
 
         else:
-            # Count consecutive unrelated attempts.
             conversation.out_of_scope_attempts = 0
 
         return {
@@ -303,41 +414,192 @@ class InsuranceSOPGraph:
         self,
         state: GraphState,
     ) -> dict[str, Any]:
-        """Verify identity before claim lookup or disclosure."""
+        """Complete identity and representative-authorization checks."""
 
         conversation = state["conversation"]
+        conversation.phase = Phase.VERIFY_ID
 
-        policyholder = (
-            self.identity_verifier.find_verified_policyholder(
-                conversation.identity_fields
-            )
-        )
+        empathy = {
+            "frustration": (
+                "I understand these extra steps can be frustrating. "
+            ),
+            "anger": (
+                "I hear that you’re upset, and I want to help. "
+            ),
+            "anxiety": (
+                "I understand this may feel worrying. "
+                "We can take it one step at a time. "
+            ),
+            "confusion": (
+                "I’m happy to explain what we need. "
+            ),
+            "refusal": (
+                "You can choose not to continue with these checks. "
+            ),
+        }.get(conversation.emotion, "")
 
-        if policyholder is None:
-            empathy = ""
-
-            if conversation.emotion is not None:
-                empathy = (
-                    "I understand this can be frustrating. "
-                    "These checks help protect your private claim details. "
-                )
-
+        if conversation.caller_role == CallerRole.UNKNOWN:
             return {
                 "response": empathy + (
-                    "I haven’t been able to verify your identity yet. "
-                    "I need three matching details from your full name, "
-                    "date of birth, phone number including country code, "
-                    "email, or SSN last four. You can use another listed "
-                    "field if you prefer not to provide one, or ask "
-                    "for human assistance."
+                    "Are you the policyholder, or are you calling "
+                    "on behalf of someone else?"
                 )
             }
 
-        conversation.verified_party_id = policyholder["party_id"]
-        conversation.phase = Phase.RESOLVE_INTENT
+        is_representative = (
+            conversation.caller_role == CallerRole.REPRESENTATIVE
+        )
 
-        # Continue within this turn using the remembered request.
-        return {"conversation": conversation}
+        if is_representative:
+            missing_details = []
+
+            if not conversation.representative_name:
+                missing_details.append("your full name")
+
+            if not conversation.representative_relationship:
+                missing_details.append(
+                    "your relationship to the policyholder"
+                )
+
+            if missing_details:
+                return {
+                    "response": empathy + (
+                        "Please provide "
+                        + " and ".join(missing_details)
+                        + ". These are your details; the identity "
+                        "verification fields must belong to the policyholder."
+                    )
+                }
+
+        # A refusal must not trigger an authorization-status advance.
+        if conversation.emotion == "refusal":
+            return {
+                "response": empathy + (
+                    "I can’t disclose claim details without the required "
+                    "identity and authorization checks. You can use another "
+                    "permitted identity field, ask the policyholder to "
+                    "contact support directly, or request human assistance."
+                )
+            }
+
+        if not conversation.is_verified:
+            policyholder = (
+                self.identity_verifier.find_verified_policyholder(
+                    conversation.identity_fields
+                )
+            )
+
+            if policyholder is None:
+                subject = (
+                    "the policyholder’s"
+                    if is_representative
+                    else "your"
+                )
+
+                return {
+                    "response": empathy + (
+                        "To protect private claim information, I need "
+                        f"three matching details from {subject} full name, "
+                        "date of birth, phone number including country code, "
+                        "email, or SSN last four. "
+                        "You can choose which three to provide."
+                    )
+                }
+
+            conversation.verified_party_id = policyholder["party_id"]
+
+        if not is_representative:
+            self._require_verified(conversation)
+            conversation.phase = Phase.RESOLVE_INTENT
+
+            return {"conversation": conversation}
+
+        party_id = conversation.verified_party_id
+
+        if party_id is None:
+            raise ValueError("Policyholder verification is required.")
+
+        representative_name = conversation.representative_name
+        relationship = conversation.representative_relationship
+
+        if not representative_name or not relationship:
+            raise ValueError("Representative details are required.")
+
+        if conversation.authorization_request_id is None:
+            # A listed relationship is a prerequisite, not approval.
+            representative = self.data_service.find_representative(
+                party_id=party_id,
+                representative_name=representative_name,
+                relationship=relationship,
+            )
+
+            if representative is None:
+                conversation.escalation_required = True
+
+                return {
+                    "conversation": conversation,
+                    "response": empathy + (
+                        "I couldn’t establish your representative relationship "
+                        "from the information provided. I can’t disclose claim "
+                        "details. Human assistance is needed to review access; "
+                        "live transfer is not connected in this demo."
+                    ),
+                }
+
+            conversation.authorization_request_id = (
+                self.authorization_service.begin_request(
+                    verified_party_id=party_id,
+                    representative_name=representative_name,
+                    relationship=relationship,
+                )
+            )
+
+        status = self.authorization_service.check_status(
+            request_id=conversation.authorization_request_id,
+            verified_party_id=party_id,
+        )
+
+        if status == "pending":
+            return {
+                "conversation": conversation,
+                "response": empathy + (
+                    "The policyholder identity details have been verified, "
+                    "but authorization for you to access the claim is pending. "
+                    "This demo simulates policyholder approval; it has not "
+                    "contacted the policyholder. You can ask me to check "
+                    "authorization again, or request human assistance. "
+                    "I can’t share claim details while approval is pending."
+                ),
+            }
+
+        if status == "approved":
+            # Recheck the complete binding before advancing.
+            self._require_verified(conversation)
+            conversation.phase = Phase.RESOLVE_INTENT
+
+            return {"conversation": conversation}
+
+        if status in {"denied", "timeout"}:
+            conversation.escalation_required = True
+
+            explanation = (
+                "The simulated authorization request was denied."
+                if status == "denied"
+                else "The simulated authorization request timed out."
+            )
+
+            return {
+                "conversation": conversation,
+                "response": empathy + (
+                    explanation
+                    + " I can’t disclose claim details. "
+                    "The policyholder can contact support directly, "
+                    "or a human representative can review authorization. "
+                    "Live transfer is not connected in this demo."
+                ),
+            }
+
+        raise ValueError("Unexpected authorization status.")
 
     def _resolve_intent_node(
         self,
@@ -437,16 +699,16 @@ class InsuranceSOPGraph:
     def _post_process_node(
         self,
         state: GraphState,
-    ) ->    dict[str, Any]:
+    ) -> dict[str, Any]:
         """Handle email consent or reopen the claim discussion."""
 
         conversation = state["conversation"]
         self._require_verified(conversation)
 
         action = self.post_process_handler.interpret_consent(
-        conversation=conversation,
-        message=state["message"],
-        )
+            conversation=conversation,
+            message=state["message"],
+            )
 
         if action == "followup":
             # Re-resolve the case because the customer may have supplied
@@ -503,22 +765,48 @@ class InsuranceSOPGraph:
         conversation: ConversationState,
     ) -> str:
         """
-        Require a verified policyholder ID before accessing claims.
+        Require identity verification and any necessary authorization.
 
         Args:
             conversation: Current conversation state.
 
         Returns:
-            Verified policyholder ID.
+            Policyholder ID permitted for claim access.
 
         Raises:
-            ValueError: If identity has not been verified.
+            ValueError: If identity, caller role, or representative
+                authorization has not been established.
         """
 
         party_id = conversation.verified_party_id
 
         if party_id is None:
             raise ValueError("Identity verification is required.")
+
+        if conversation.caller_role == CallerRole.POLICYHOLDER:
+            return party_id
+
+        if conversation.caller_role != CallerRole.REPRESENTATIVE:
+            raise ValueError("The caller's role must be established.")
+
+        request_id = conversation.authorization_request_id
+        representative_name = conversation.representative_name
+        relationship = conversation.representative_relationship
+
+        if not request_id or not representative_name or not relationship:
+            raise ValueError("Representative authorization is required.")
+
+        approved = self.authorization_service.is_approved(
+            request_id=request_id,
+            verified_party_id=party_id,
+            representative_name=representative_name,
+            relationship=relationship,
+        )
+
+        if not approved:
+            raise ValueError(
+                "Representative authorization has not been approved."
+            )
 
         return party_id
 

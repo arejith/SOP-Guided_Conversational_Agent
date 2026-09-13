@@ -60,7 +60,10 @@ class CaseHandler:
 
         decision = self.llm_service.ask_json(
             CASE_SELECTION_PROMPT,
-            {
+            {   "access_context": {
+                             "claim_access_authorized": True,
+                                "source": "SOP controller access and ownership checks",
+                                },
                 "request": message,
                 "recent_messages": conversation.messages[-8:],
                 "intent": conversation.remembered_intent,
