@@ -2,6 +2,9 @@
   "default": {
     "status_sequence": ["pending", "approved"]
   },
+  "denied": {
+    "status_sequence": ["denied"]
+  },
   "timeout": {
     "status_sequence": ["pending", "pending", "pending", "pending", "pending"]
   }
