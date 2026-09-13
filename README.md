@@ -6,8 +6,9 @@ and transitions through `VERIFY_ID → RESOLVE_INTENT → PROCESS_CASE → POST_
 The model interprets customer language and writes answers using authorized records.
 
 ## Run locally
+download python 3.11
 
-Use Python 3.12 from the repository directory:
+Use Python 3.11 from the repository directory:
 
 ```bash
 python -m venv .venv
@@ -33,7 +34,7 @@ python -m streamlit run app.py --browser.gatherUsageStats=false
 ```
 
 Open the local URL printed by Streamlit (normally `http://localhost:8501`).
-Enter an OpenAI API key into the password field in the sidebar, confirm the model,
+Enter an OpenAI API key into the  field in the sidebar (left side), confirm the model,
 and select **Connect**. `gpt-4.1-mini` remains the default. The selected model must
 support the Responses API and strict structured outputs.
 
@@ -136,6 +137,12 @@ to verify the model's interpretation or generated prose.
 
 Optional live tests incur OpenAI API usage and read the configured key locally:
 
+create an empty file called `.env` in the root folder. Inside the file add:
+``` bash
+OPENAI_API_KEY= <YOUR_OPEN_AI_ API_KEY>
+OPENAI_MODEL=gpt-4.1-mini
+```
+
 ```bash
 python -m pytest -m live tests/test_live_semantics.py -q
 python -m pytest -m live tests/test_existing.py -q
@@ -143,7 +150,7 @@ python -m pytest -m live tests/test_existing.py -q
 
 They skip when no key is configured. No API credential was available during this
 review, so live interpretation, answer quality, and API connectivity remain to
-be checked before presenting the live demo. See [review and validation notes](docs/review.md).
+be checked before presenting the live demo.
 
 ## Scope and limitations
 
